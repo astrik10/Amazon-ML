@@ -1,0 +1,12 @@
+# Core data handling
+pandas==2.2.2
+numpy==1.26.4
+
+# Classical ML model + persistence (BSD license)
+scikit-learn==1.5.1
+joblib==1.4.2
+
+# Fast string similarity (Levenshtein, Jaro-Winkler) -- MIT license.
+# Chosen instead of python-Levenshtein because it is pure-C++/pybind11
+# with no GPL dependency and is noticeably faster on large candidate sets.
+rapidfuzz==3.9.6
