@@ -28,7 +28,8 @@ def train_final_model(
     """
     gt_lookup = labels.build_ground_truth_lookup(train_ground_truth_df)
 
-    candidates = blocking.generate_candidates(train_source1_df, train_source2_df, train_source3_df)
+    candidate_index = blocking.build_candidate_index(train_source2_df, train_source3_df)
+    candidates = blocking.generate_candidates(train_source1_df, candidate_index)
     pairs = blocking.explode_candidate_pairs(candidates)
     pairs = labels.attach_pair_labels(pairs, gt_lookup)
 
@@ -61,7 +62,8 @@ def run_test_inference(
     from-scratch test run would see and avoids depending on train-only
     vocabulary that may not cover test terms.
     """
-    candidates = blocking.generate_candidates(test_source1_df, test_source2_df, test_source3_df)
+    candidate_index = blocking.build_candidate_index(test_source2_df, test_source3_df)
+    candidates = blocking.generate_candidates(test_source1_df, candidate_index)
     pairs = blocking.explode_candidate_pairs(candidates)
 
     entity_pool = features.build_entity_pool(test_source1_df, test_source2_df, test_source3_df)

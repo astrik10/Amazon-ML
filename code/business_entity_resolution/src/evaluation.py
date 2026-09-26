@@ -167,9 +167,13 @@ def run_validation(
     train_s1 = source1_df[source1_df["entity_id"].isin(train_ids)].reset_index(drop=True)
     val_s1 = source1_df[source1_df["entity_id"].isin(val_ids)].reset_index(drop=True)
 
-    # --- candidate generation, restricted per split (S2/S3 pool is shared/full) ---
-    train_candidates = blocking.generate_candidates(train_s1, source2_df, source3_df)
-    val_candidates = blocking.generate_candidates(val_s1, source2_df, source3_df)
+    # --- candidate generation ---
+    # Source2/Source3 (the candidate pool) is the SAME for both the train
+    # split and the val split, so build the (expensive) candidate-side
+    # index once and reuse it for both, instead of rebuilding it twice.
+    candidate_index = blocking.build_candidate_index(source2_df, source3_df)
+    train_candidates = blocking.generate_candidates(train_s1, candidate_index)
+    val_candidates = blocking.generate_candidates(val_s1, candidate_index)
 
     train_pairs = blocking.explode_candidate_pairs(train_candidates)
     val_pairs = blocking.explode_candidate_pairs(val_candidates)

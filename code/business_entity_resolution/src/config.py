@@ -51,9 +51,29 @@ THRESHOLD_CANDIDATES = [0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90]
 # ---------------------------------------------------------------------------
 # Blocking
 # ---------------------------------------------------------------------------
-MIN_TOKEN_LENGTH = 3          # ignore very short/noisy tokens when blocking
-NGRAM_SIZE = 4                # character n-gram size used for n-gram blocking
+# NOTE ON SCALE: at ~12.5M total records, exploding address tokens over the
+# full ~10.3M-record candidate pool produced ~23M rows and was a major
+# memory cost (see blocking.py). MIN_TOKEN_LENGTH and MAX_POSTING_LIST_SIZE
+# below were tightened from their original values to cut memory usage --
+# they trade a small amount of blocking recall for a much smaller footprint.
+MIN_TOKEN_LENGTH = 4            # ignore very short/noisy tokens when blocking (was 3)
+NGRAM_SIZE = 4                  # character n-gram size used for n-gram blocking
 MAX_CANDIDATES_PER_ENTITY = 60  # soft cap; highest-scoring candidates kept
+
+# A token/n-gram/postal value shared by more than this many candidate
+# records is dropped from that blocking rule before the merge -- too
+# common to prune anything, and expensive to carry through at this scale.
+MAX_POSTING_LIST_SIZE = 1000    # was effectively 5000 (default) before
+
+# Character n-gram blocking is the most memory/time-expensive rule at this
+# scale (10M+ rows x ~17 four-grams each before capping). Off by default.
+ENABLE_NGRAM_BLOCKING = False
+
+# Address-token blocking is the second most expensive rule (~23M exploded
+# rows on this dataset) for comparatively little extra recall once name
+# tokens + postal code are already blocking. Off by default at this scale;
+# turn back on if candidate recall in the validation report looks too low.
+ENABLE_ADDR_TOKEN_BLOCKING = False
 
 # ---------------------------------------------------------------------------
 # Model

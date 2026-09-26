@@ -3,8 +3,16 @@ Feature engineering for candidate Source-1 / Source-2-or-3 pairs.
 
 All features are numeric and missing-value-safe. Name/address similarity
 uses rapidfuzz (MIT licensed) for Levenshtein and Jaro-Winkler style
-similarity, plus scikit-learn's TfidfVectorizer + cosine similarity for a
-softer, term-weighted signal. No external services are used.
+similarity, plus scikit-learn's TfidfVectorizer for a softer, term-weighted
+signal. No external services are used.
+
+PERF NOTE: TfidfVectorizer output is L2-normalized by default, so cosine
+similarity between two rows is just their dot product. Instead of calling
+cosine_similarity() once per pair (which was the main bottleneck -- lots of
+tiny sklearn calls add up fast over thousands of pairs), we now slice out
+all the "left" rows and all the "right" rows for the whole batch at once
+and do a single vectorized sparse multiply + sum. Same numbers, much less
+overhead.
 """
 from __future__ import annotations
 
@@ -13,9 +21,9 @@ from typing import Iterable
 
 import numpy as np
 import pandas as pd
+import scipy.sparse as sp
 from rapidfuzz.distance import Levenshtein, JaroWinkler
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +92,11 @@ class FeatureBuilder:
         self._addr_matrix = None
         self._id_to_row: dict[str, int] = {}
         self._records: dict[str, dict] = {}
+        # row index used for any entity_id we don't recognize -- points at
+        # an all-zero row appended to both matrices, so dot products with
+        # it are always 0 (matches the old "return 0.0 for missing id"
+        # behavior).
+        self._missing_row: int = 0
 
     def fit(self, records_df: pd.DataFrame) -> "FeatureBuilder":
         """
@@ -100,8 +113,16 @@ class FeatureBuilder:
         # against a degenerate all-empty corpus.
         safe_names = names if any(names) else ["__empty__"]
         safe_addrs = addrs if any(addrs) else ["__empty__"]
-        self._name_matrix = self.name_vectorizer.fit_transform(safe_names)
-        self._addr_matrix = self.addr_vectorizer.fit_transform(safe_addrs)
+        name_matrix = self.name_vectorizer.fit_transform(safe_names)
+        addr_matrix = self.addr_vectorizer.fit_transform(safe_addrs)
+
+        # Append a zero row to each matrix as the fallback for unknown ids,
+        # so batch lookups never need a Python-level branch per pair.
+        zero_name_row = sp.csr_matrix((1, name_matrix.shape[1]))
+        zero_addr_row = sp.csr_matrix((1, addr_matrix.shape[1]))
+        self._name_matrix = sp.vstack([name_matrix, zero_name_row]).tocsr()
+        self._addr_matrix = sp.vstack([addr_matrix, zero_addr_row]).tocsr()
+        self._missing_row = self._name_matrix.shape[0] - 1
 
         self._id_to_row = {eid: i for i, eid in enumerate(records_df["entity_id"])}
         self._records = {
@@ -118,12 +139,13 @@ class FeatureBuilder:
         return self
 
     def _tfidf_cosine(self, matrix, id_a: str, id_b: str) -> float:
-        row_a = self._id_to_row.get(id_a)
-        row_b = self._id_to_row.get(id_b)
-        if row_a is None or row_b is None:
-            return 0.0
-        sim = cosine_similarity(matrix[row_a], matrix[row_b])
-        return float(sim[0, 0])
+        """Kept for single-pair use (e.g. debugging/ad-hoc lookups). The
+        batch path below (build_features_for_pairs) doesn't call this."""
+        row_a = self._id_to_row.get(id_a, self._missing_row)
+        row_b = self._id_to_row.get(id_b, self._missing_row)
+        vec_a = matrix[row_a]
+        vec_b = matrix[row_b]
+        return float(vec_a.multiply(vec_b).sum())
 
     def build_pair_features(self, source1_entity_id: str, candidate_entity_id: str) -> dict:
         rec_a = self._records.get(source1_entity_id, {})
@@ -168,6 +190,12 @@ class FeatureBuilder:
         pairs_df must contain source1_entity_id, candidate_entity_id columns.
         Returns a DataFrame with the original columns plus every feature in
         FEATURE_COLUMNS (all numeric, no NaNs).
+
+        This is the hot path for the whole pipeline, so it's written to do
+        the expensive part (TF-IDF cosine) as one batched sparse-matrix op
+        instead of a Python-level call per row, and to pull scalar fields
+        out of self._records once up front instead of re-doing dict lookups
+        inside a per-row function call.
         """
         if pairs_df.empty:
             empty = pairs_df.copy()
@@ -175,10 +203,66 @@ class FeatureBuilder:
                 empty[col] = pd.Series(dtype="float64")
             return empty
 
-        feature_rows = [
-            self.build_pair_features(row.source1_entity_id, row.candidate_entity_id)
-            for row in pairs_df.itertuples(index=False)
-        ]
+        s1_ids = pairs_df["source1_entity_id"].to_numpy()
+        cand_ids = pairs_df["candidate_entity_id"].to_numpy()
+        n = len(pairs_df)
+
+        # --- batched TF-IDF cosine (the part that used to be slow) ---
+        rows_a = np.fromiter(
+            (self._id_to_row.get(i, self._missing_row) for i in s1_ids), dtype=np.int64, count=n
+        )
+        rows_b = np.fromiter(
+            (self._id_to_row.get(i, self._missing_row) for i in cand_ids), dtype=np.int64, count=n
+        )
+
+        name_cos = np.asarray(
+            self._name_matrix[rows_a].multiply(self._name_matrix[rows_b]).sum(axis=1)
+        ).ravel()
+        addr_cos = np.asarray(
+            self._addr_matrix[rows_a].multiply(self._addr_matrix[rows_b]).sum(axis=1)
+        ).ravel()
+
+        # --- pull the rest of the per-entity fields once, as plain lists ---
+        empty_rec: dict = {}
+        recs_a = [self._records.get(i, empty_rec) for i in s1_ids]
+        recs_b = [self._records.get(i, empty_rec) for i in cand_ids]
+
+        feature_rows = []
+        for idx in range(n):
+            rec_a, rec_b = recs_a[idx], recs_b[idx]
+            name_a, name_b = rec_a.get("name", ""), rec_b.get("name", "")
+            addr_a, addr_b = rec_a.get("address", ""), rec_b.get("address", "")
+            country_a, country_b = rec_a.get("country", ""), rec_b.get("country", "")
+            postal_a, postal_b = rec_a.get("postal", ""), rec_b.get("postal", "")
+            source_b = rec_b.get("source", "")
+
+            name_tokens_a, name_tokens_b = _token_set(name_a), _token_set(name_b)
+            addr_tokens_a, addr_tokens_b = _token_set(addr_a), _token_set(addr_b)
+
+            feature_rows.append({
+                "name_exact_match": float(bool(name_a) and name_a == name_b),
+                "name_char_similarity": _char_similarity(name_a, name_b),
+                "name_levenshtein_similarity": Levenshtein.normalized_similarity(name_a, name_b)
+                if (name_a or name_b) else 0.0,
+                "name_jaro_winkler_similarity": JaroWinkler.similarity(name_a, name_b)
+                if (name_a or name_b) else 0.0,
+                "name_token_jaccard": _jaccard(name_tokens_a, name_tokens_b),
+                "name_token_overlap": float(len(name_tokens_a & name_tokens_b)),
+                "name_tfidf_cosine": float(name_cos[idx]),
+                "name_length_diff": float(abs(len(name_a) - len(name_b))),
+                "address_exact_match": float(bool(addr_a) and addr_a == addr_b),
+                "address_char_similarity": _char_similarity(addr_a, addr_b),
+                "address_levenshtein_similarity": Levenshtein.normalized_similarity(addr_a, addr_b)
+                if (addr_a or addr_b) else 0.0,
+                "address_token_jaccard": _jaccard(addr_tokens_a, addr_tokens_b),
+                "address_token_overlap": float(len(addr_tokens_a & addr_tokens_b)),
+                "address_tfidf_cosine": float(addr_cos[idx]),
+                "address_length_diff": float(abs(len(addr_a) - len(addr_b))),
+                "postal_code_match": float(bool(postal_a) and bool(postal_b) and postal_a == postal_b),
+                "country_exact_match": float(bool(country_a) and country_a == country_b),
+                "is_source3": float(source_b == "source3"),
+            })
+
         feature_df = pd.DataFrame(feature_rows, columns=FEATURE_COLUMNS)
         feature_df = feature_df.fillna(0.0)
         result = pd.concat(

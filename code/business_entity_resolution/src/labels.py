@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import pandas as pd
 
+_EMPTY: set[str] = set()
+
 
 def parse_matched_ids(raw: object) -> set[str]:
     """Parse a comma-separated matched_entity_ids string into a set of IDs."""
@@ -39,12 +41,19 @@ def attach_pair_labels(pairs_df: pd.DataFrame, gt_lookup: dict[str, set[str]]) -
     a binary 'label' column: 1 if the candidate is a true match for that
     Source-1 entity, else 0. Source-1 entities absent from ground truth are
     treated as having no matches (label 0 for all their candidates).
+
+    PERF NOTE: this used to be `out.apply(_label, axis=1)`, which calls a
+    Python function once per row through pandas' row-apply machinery --
+    on a few hundred thousand candidate pairs that adds up to most of the
+    pipeline's runtime for something that's really just two dict lookups.
+    A plain zip + list comprehension does the same thing without the
+    per-row Series construction overhead.
     """
     out = pairs_df.copy()
-
-    def _label(row) -> int:
-        true_matches = gt_lookup.get(row.source1_entity_id, set())
-        return 1 if row.candidate_entity_id in true_matches else 0
-
-    out["label"] = out.apply(_label, axis=1)
+    s1_ids = out["source1_entity_id"]
+    cand_ids = out["candidate_entity_id"]
+    out["label"] = [
+        1 if cand_id in gt_lookup.get(s1_id, _EMPTY) else 0
+        for s1_id, cand_id in zip(s1_ids, cand_ids)
+    ]
     return out

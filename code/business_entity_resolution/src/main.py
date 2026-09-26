@@ -28,6 +28,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# --------------------------------------------------------------------------
+# TEMP: sanity-check switch. Set to None (or 0) to run the full dataset.
+# Set to a small number (e.g. 20000) to first confirm the pipeline runs
+# clean and to get a rough per-entity timing before committing to the full
+# ~2.2M-row run. REMOVE / set back to None once you've validated things.
+# --------------------------------------------------------------------------
+SAMPLE_SOURCE1_ROWS: int | None = 20000
+
 
 def set_global_seed(seed: int = config.RANDOM_SEED) -> None:
     random.seed(seed)
@@ -55,6 +63,15 @@ def main() -> int:
     train_source3 = _normalize(train_data["source3"])
     ground_truth = train_data["ground_truth"]
 
+    if SAMPLE_SOURCE1_ROWS:
+        logger.info(
+            "TEMP SAMPLE MODE: limiting Source-1 to first %d rows (out of %d) for a quick sanity check",
+            SAMPLE_SOURCE1_ROWS, len(train_source1),
+        )
+        train_source1 = train_source1.head(SAMPLE_SOURCE1_ROWS).reset_index(drop=True)
+        sample_ids = set(train_source1["entity_id"])
+        ground_truth = ground_truth[ground_truth["source1_entity_id"].isin(sample_ids)].reset_index(drop=True)
+
     logger.info("STEP 2/5: Running entity-level validation")
     val_result = evaluation.run_validation(train_source1, train_source2, train_source3, ground_truth)
     chosen_threshold = val_result.chosen_threshold
@@ -76,6 +93,9 @@ def main() -> int:
     test_source1 = _normalize(test_data["source1"])
     test_source2 = _normalize(test_data["source2"])
     test_source3 = _normalize(test_data["source3"])
+
+    if SAMPLE_SOURCE1_ROWS:
+        test_source1 = test_source1.head(SAMPLE_SOURCE1_ROWS).reset_index(drop=True)
 
     logger.info("STEP 5/5: Running test inference and writing outputs")
     matching_results_df, candidate_pairs_df = inference.run_test_inference(
