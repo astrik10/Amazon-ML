@@ -105,20 +105,31 @@ only** is the one used for test inference.
 
 ## 6. How blocking works
 
-`src/blocking.py` builds inverted indexes over the Source-2/Source-3 pool:
+`src/blocking.py` builds inverted indexes over the Source-2/Source-3 pool
+once per run and reuses them for every Source-1 batch matched against that
+pool (train split, validation split, final training run), instead of
+rebuilding the index from scratch each time:
 
-| Rule | Signal |
-|---|---|
-| Country block | exact normalized country match |
-| Name token block | shared normalized business-name tokens (≥3 chars) |
-| Address token block | shared normalized address tokens (≥3 chars) |
-| Name character n-gram block | shared 4-character n-grams of the name (catches typos/abbrev.) |
-| Postal/PIN block | shared postal code heuristically extracted from the address |
+| Rule | Signal | Default |
+|---|---|---|
+| Country block | exact normalized country match | on |
+| Name token block | shared normalized business-name tokens (≥ `MIN_TOKEN_LENGTH`) | on |
+| Address token block | shared normalized address tokens (≥ `MIN_TOKEN_LENGTH`) | off — `config.ENABLE_ADDR_TOKEN_BLOCKING` |
+| Name character n-gram block | shared 4-character n-grams of the name (catches typos/abbrev.) | off — `config.ENABLE_NGRAM_BLOCKING` |
+| Postal/PIN block | shared postal code heuristically extracted from the address | on |
 
-A candidate is kept if it is retrieved by **any** rule (union, for recall).
-Each rule that fires for a candidate adds to a simple score; if an entity
-ends up with more than `MAX_CANDIDATES_PER_ENTITY` (default 60) candidates,
-only the highest-scoring ones are kept — a soft cap, not a hard filter, so
+A candidate is kept if it is retrieved by **any enabled** rule (union, for
+recall). Address-token and n-gram blocking add recall but are the most
+expensive rules on large record counts, so they're off by default and can
+be flipped on in `config.py` for smaller datasets or if the validation
+report's candidate recall is lower than desired.
+
+Keys shared by more than `config.MAX_POSTING_LIST_SIZE` candidate records
+are dropped from a rule before matching — too common to be a useful
+blocking signal, and expensive to carry through otherwise. Each rule that
+fires for a candidate adds to a simple score; if an entity ends up with
+more than `MAX_CANDIDATES_PER_ENTITY` (default 60) candidates, only the
+highest-scoring ones are kept — a soft cap, not a hard filter, so
 comparisons stay tractable without sacrificing recall.
 
 ---
@@ -137,7 +148,9 @@ covering:
 
 TF-IDF vectorizers are fit once per pipeline run (once for the validation
 split, once for test inference) over the relevant Source-1+2+3 corpus, so
-vocabulary never leaks between the two runs.
+vocabulary never leaks between the two runs. The TF-IDF cosine similarity
+itself is computed for a whole batch of pairs at once via a vectorized
+sparse dot product, rather than one pair at a time.
 
 ---
 
@@ -235,10 +248,10 @@ are used anywhere in the pipeline.
 business_entity_resolution/
 ├── src/
 │   ├── __init__.py
-│   ├── config.py          # paths, seeds, thresholds, schema
+│   ├── config.py          # paths, seeds, thresholds, schema, blocking limits
 │   ├── data_loader.py      # TSV loading + schema/source validation
 │   ├── preprocessing.py    # text normalization
-│   ├── blocking.py         # candidate generation
+│   ├── blocking.py         # candidate generation (reusable candidate index)
 │   ├── labels.py           # ground-truth parsing / pair labeling
 │   ├── features.py         # similarity feature engineering
 │   ├── model.py             # LogisticRegression / RandomForest wrapper

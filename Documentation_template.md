@@ -15,29 +15,45 @@ consistent and reproducible.
 ## Candidate Generation / Blocking
 
 Rather than scoring every possible Source-1 × (Source-2 ∪ Source-3) pair,
-five inverted-index blocking rules are applied over the Source-2/Source-3
-pool and a candidate is retained if it is returned by **any** rule
-(recall-favoring union):
+a set of inverted-index blocking rules is applied over the Source-2/
+Source-3 pool and a candidate is retained if it is returned by **any**
+enabled rule (recall-favoring union):
 
 1. **Exact normalized country** — groups records sharing an identical
    normalized country string.
-2. **Shared business-name tokens** — tokens of length ≥3 from the
-   normalized name.
-3. **Shared address tokens** — tokens of length ≥3 from the normalized
-   address.
+2. **Shared business-name tokens** — tokens of length ≥ `MIN_TOKEN_LENGTH`
+   from the normalized name.
+3. **Shared address tokens** — tokens of length ≥ `MIN_TOKEN_LENGTH` from
+   the normalized address. Enabled via `config.ENABLE_ADDR_TOKEN_BLOCKING`.
 4. **Character n-gram overlap on the name** — 4-character shingles, which
    catch near-duplicate names blocking misses on token boundaries (e.g.
-   minor misspellings).
+   minor misspellings). Enabled via `config.ENABLE_NGRAM_BLOCKING`.
 5. **Postal/PIN code overlap** — a postal-like code heuristically extracted
    from the raw address (a run of 4–8 digits), when present in both
-   records.
+   records; weighted higher than the other rules since it's a low-noise
+   signal.
 
-Every rule that matches a given candidate increments a simple integer
-score for that candidate. If, after taking the union across all rules, a
-Source-1 entity has more than `MAX_CANDIDATES_PER_ENTITY` (60 by default)
-candidates, only the highest-scoring ones are kept — this is a soft cap for
-tractability, applied only in the rare case blocking is unusually
-permissive, and it never removes a candidate that no rule would have
+The candidate-side inverted index (built from Source-2 + Source-3) is
+built once per run and reused across every batch of Source-1 entities
+matched against it, rather than being rebuilt per split — the pool doesn't
+change between the train split, the validation split, and the final
+training run, so there's no reason to redo that work each time.
+
+Any single key (a token, n-gram, or postal code) shared by more than
+`config.MAX_POSTING_LIST_SIZE` candidate records is dropped from that
+rule before matching — a value that common carries almost no pruning
+signal, and keeping it in would mean matching a large fraction of the
+whole pool against it for no benefit. Address-token and n-gram blocking
+are the most expensive rules at large record counts and are off by
+default; they can be re-enabled per dataset size if candidate recall in
+the validation report indicates the extra signal is needed.
+
+Every rule that matches a given candidate contributes to a simple integer
+score for that candidate. If, after taking the union across all enabled
+rules, a Source-1 entity has more than `MAX_CANDIDATES_PER_ENTITY` (60 by
+default) candidates, only the highest-scoring ones are kept — a soft cap
+for tractability, applied only when blocking is unusually permissive for a
+given entity, and it never removes a candidate that no rule would have
 retained in the first place.
 
 ## Feature Engineering
@@ -60,7 +76,11 @@ different data quality).
 
 TF-IDF vectorizers are fit fresh on the relevant record pool for each
 pipeline run (the validation run's train+val entities, and separately the
-final test run), so no vocabulary leaks between training and test.
+final test run), so no vocabulary leaks between training and test. The
+TF-IDF cosine similarity for a whole batch of candidate pairs is computed
+as a single vectorized sparse-matrix operation rather than pair-by-pair,
+since TF-IDF vectors are already L2-normalized and cosine similarity
+reduces to a dot product.
 
 ## Model Architecture
 

@@ -1,6 +1,7 @@
 # Core data handling
 pandas==2.2.2
 numpy==1.26.4
+scipy==1.13.1
 
 # Classical ML model + persistence (BSD license)
 scikit-learn==1.5.1
