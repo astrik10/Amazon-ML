@@ -1,147 +1,252 @@
-# Business Entity Resolution — Methodology
+# Documentation_template.md — Business Entity Resolution
 
-## Methodology
+Team: TENSOR-TITANS
+Challenge: Amazon ML Challenge 2026 — Business Entity Resolution
 
-The pipeline resolves Source-1 business records against Source-2 and
-Source-3 in five stages: (1) text normalization, (2) multi-stage blocking
-to generate a tractable candidate set per Source-1 entity, (3) ground-truth
-label attachment for the training candidates, (4) numeric feature
-engineering over every candidate pair, and (5) a classical supervised
-classifier that outputs a match probability, thresholded using a held-out,
-entity-level validation split. The same normalization, blocking and feature
-code paths run identically at train and test time so behavior is
-consistent and reproducible.
+---
 
-## Candidate Generation / Blocking
+## 1. Methodology Used
 
-Rather than scoring every possible Source-1 × (Source-2 ∪ Source-3) pair,
-a set of inverted-index blocking rules is applied over the Source-2/
-Source-3 pool and a candidate is retained if it is returned by **any**
-enabled rule (recall-favoring union):
+In simple words, our job was to look at business records coming from three
+different sources and figure out which ones are actually talking about the
+same real business — even when the name is spelled differently, the address
+is written in a different way, or some details are missing.
 
-1. **Exact normalized country** — groups records sharing an identical
-   normalized country string.
-2. **Shared business-name tokens** — tokens of length ≥ `MIN_TOKEN_LENGTH`
-   from the normalized name.
-3. **Shared address tokens** — tokens of length ≥ `MIN_TOKEN_LENGTH` from
-   the normalized address. Enabled via `config.ENABLE_ADDR_TOKEN_BLOCKING`.
-4. **Character n-gram overlap on the name** — 4-character shingles, which
-   catch near-duplicate names blocking misses on token boundaries (e.g.
-   minor misspellings). Enabled via `config.ENABLE_NGRAM_BLOCKING`.
-5. **Postal/PIN code overlap** — a postal-like code heuristically extracted
-   from the raw address (a run of 4–8 digits), when present in both
-   records; weighted higher than the other rules since it's a low-noise
-   signal.
+We solved this in **five simple steps**, and the whole thing runs with one
+command: `python -m src.main`
 
-The candidate-side inverted index (built from Source-2 + Source-3) is
-built once per run and reused across every batch of Source-1 entities
-matched against it, rather than being rebuilt per split — the pool doesn't
-change between the train split, the validation split, and the final
-training run, so there's no reason to redo that work each time.
+1. **Cleaning up the text (Normalization)** — *(`src/data_loader.py`)*
+   Business names and addresses are written very differently by different
+   people — some write "Rd", some write "Road"; some write "Pvt Ltd", some
+   write "Private Limited". So the first thing we do is clean everything up:
+   convert to lowercase, remove punctuation and accents, and expand common
+   short forms to a standard form. This way, two records that actually mean
+   the same thing start looking similar to the computer too.
 
-Any single key (a token, n-gram, or postal code) shared by more than
-`config.MAX_POSTING_LIST_SIZE` candidate records is dropped from that
-rule before matching — a value that common carries almost no pruning
-signal, and keeping it in would mean matching a large fraction of the
-whole pool against it for no benefit. Address-token and n-gram blocking
-are the most expensive rules at large record counts and are off by
-default; they can be re-enabled per dataset size if candidate recall in
-the validation report indicates the extra signal is needed.
+2. **Shortlisting possible matches (Candidate Generation / Blocking)** — *(`src/blocking.py`)*
+   We can't compare every Source-1 record with every single Source-2 and
+   Source-3 record — there are millions of records, so that would take
+   forever. Instead, for every Source-1 entity, we quickly shortlist a small
+   set of realistic possible matches. Full details on how we do this are in
+   Section 2.
 
-Every rule that matches a given candidate contributes to a simple integer
-score for that candidate. If, after taking the union across all enabled
-rules, a Source-1 entity has more than `MAX_CANDIDATES_PER_ENTITY` (60 by
-default) candidates, only the highest-scoring ones are kept — a soft cap
-for tractability, applied only when blocking is unusually permissive for a
-given entity, and it never removes a candidate that no rule would have
-retained in the first place.
+3. **Attaching the answer key (only for training data)** — *(`src/evaluation.py`)*
+   For the training data, we already know the correct answers
+   (`train_ground_truth.tsv`). So we label every shortlisted pair as
+   1 (actual match) or 0 (not a match), so our model can learn from it.
 
-## Feature Engineering
+4. **Turning pairs into numbers (Feature Engineering)** — *(`src/features.py`)*
+   Computers can't understand "this name looks similar" the way humans do —
+   so we convert every pair of records into a set of numeric similarity
+   scores (how similar the names are, how similar the addresses are, etc.).
+   Details are in Section 3.
 
-All features are numeric and missing-value-safe (missing text normalizes
-to the empty string, which every similarity function handles explicitly).
+5. **Predicting matches (Model + Threshold)** — *(`src/model.py` and `src/inference.py`)*
+   A machine learning model looks at these numbers and gives a probability
+   score for each pair — basically "how likely is it that these two records
+   are the same business?". We then pick one cut-off point (called a
+   threshold) using our validation data, and use that same cut-off point to
+   decide the final matches on the test data.
 
-**Name features**: exact match, character-set (Jaccard-style) similarity,
-Levenshtein normalized similarity, Jaro-Winkler similarity, token Jaccard
-similarity, raw token overlap count, TF-IDF cosine similarity, and absolute
-length difference.
+The good part is: the exact same cleaning, shortlisting, and
+feature-building code runs during training and during testing — so there is
+no unfair advantage or mismatch between the two.
 
-**Address features**: the same family (exact match, character similarity,
-Levenshtein similarity, token Jaccard, token overlap, TF-IDF cosine, length
-difference), plus an explicit postal-code match flag.
+**Why we process data in batches (chunks):** *(controlled by `config.SOURCE1_CHUNK_SIZE` in `src/config.py`, used in `src/blocking.py`, `src/evaluation.py`, and `src/inference.py`)*
+The dataset is huge — about 2.2 million Source-1 records, 5 million
+Source-2 records, and 5.3 million Source-3 records for training alone (and
+a similarly large test set). Trying to process all of this in one go uses
+too much memory and can crash the program. So instead, we break the
+Source-1 records into batches of 50,000 at a time, and process one batch
+after another. The final result is exactly the same as processing
+everything at once — it's just done in smaller, safer pieces so the
+pipeline runs reliably.
 
-**Other**: country exact match, and a flag for whether the candidate comes
-from Source-3 vs. Source-2 (since the two sources may have systematically
-different data quality).
+**How we created our validation set:** *(`src/evaluation.py`)*
+Before doing any shortlisting, we split the training *entities* (not rows,
+not random pairs — whole entities) into a training part and a validation
+part. We do this using a fixed random seed (`42`), so the split is always
+the same every time we run the code. This makes sure that all records of
+one entity stay together on the same side of the split, so there's no
+"cheating" by accidentally leaking information. The final model that we
+use for the actual test predictions is trained again — this time on 100%
+of the training data — so it learns from every example we have.
 
-TF-IDF vectorizers are fit fresh on the relevant record pool for each
-pipeline run (the validation run's train+val entities, and separately the
-final test run), so no vocabulary leaks between training and test. The
-TF-IDF cosine similarity for a whole batch of candidate pairs is computed
-as a single vectorized sparse-matrix operation rather than pair-by-pair,
-since TF-IDF vectors are already L2-normalized and cosine similarity
-reduces to a dot product.
+**How we measured our own performance:** *(`src/evaluation.py`)*
+This matches exactly how the challenge itself is scored. For every
+Source-1 entity, we check how many of its predicted matches are correct
+(precision) and how many of the true matches we actually found (recall),
+and combine them into an F0.5 score (this metric cares more about being
+correct than about catching every single match). We then average this
+score across all entities — this is called **macro entity-level F0.5**.
+One important rule: if an entity genuinely has no matches and we correctly
+predict "no matches", it scores a full 1.0. If we wrongly guess a match for
+it, it scores 0.0.
 
-## Model Architecture
+**How we picked our final cut-off (threshold):** *(`src/evaluation.py`)*
+We tried seven different cut-off points — 0.30, 0.40, 0.50, 0.60, 0.70,
+0.80, and 0.90 — on our validation data, and picked whichever one gave the
+best macro entity-level F0.5 score. We then used this exact same cut-off
+for the test data, without any further tweaking.
 
-The default model is scikit-learn's `LogisticRegression` with
-`class_weight="balanced"` to counteract the heavy non-match/match class
-imbalance inherent to entity resolution (most candidate pairs are
-non-matches even after blocking). It is fast, well-calibrated for
-`predict_proba()`-based thresholding, and easy to reason about. A
-`RandomForestClassifier` baseline is available as a drop-in alternative via
-`config.MODEL_TYPE`. Both are BSD-licensed, classical (non-deep-learning)
-models with no parameter-count concerns relative to the 8B ceiling.
+**Our results on the full training/validation data**
+(1,765,457 training entities / 441,364 validation entities):
 
-## Validation
+| Metric | Value |
+|---|---|
+| Candidate recall (train) | 0.280 |
+| Candidate recall (validation) | 0.280 |
+| Chosen threshold | 0.90 |
+| Pair-level precision at chosen threshold | 0.8286 |
+| Pair-level recall at chosen threshold | 0.9577 |
+| Pair-level F0.5 at chosen threshold | 0.8515 |
+| **Macro entity-level F0.5 at chosen threshold (this is the official scoring metric)** | **0.3513** |
+| Singleton accuracy at chosen threshold | 0.806 |
 
-The Source-1 **training entities** (not raw rows or pairs) are split into a
-train portion and a validation portion using a seeded, deterministic
-shuffle. Because the split happens at the entity level before any
-candidate generation, no record belonging to one Source-1 entity can appear
-in both the train and validation portions. The model used to score the
-validation split is trained only on the train-portion's candidate pairs;
-the final model used for test inference is retrained afterward on 100% of
-the training data.
+**Why is the pair-level score (0.85) so much higher than the entity-level
+score (0.35)?**
+This comes down to our candidate recall being only 0.280. In simple terms:
+our shortlisting step only manages to include about 28% of all true matches
+in its shortlist in the first place. So even if our model is very good at
+picking correct matches *from the shortlist*, it can never find the other
+72% of true matches — they were never even offered to it as an option. And
+because we score entity-by-entity, missing even one true match for an
+entity brings down that entity's own score. So the biggest opportunity to
+improve our score further is to improve the shortlisting step itself (for
+example, by turning on address-token shortlisting, which we currently keep
+switched off for memory reasons — see Section 2).
 
-Metrics reported: pair-level precision/recall/F0.5 (F0.5 = 1.25·P·R /
-(0.25·P + R), weighting precision higher than recall), and — matching how
-the challenge is scored — a **macro-averaged entity-level F0.5** where each
-Source-1 entity's predicted match set is compared against its true match
-set, with explicit singleton handling (an entity with no true matches
-scores 1.0 if predicted empty, 0.0 if predicted non-empty).
+---
 
-## Threshold Selection
+## 2. Candidate Generation / Blocking Strategy — *(`src/blocking.py`)*
 
-Every threshold in `{0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90}` is applied
-to the validation-split predicted probabilities. The threshold that
-maximizes **macro entity-level F0.5 on the validation split** is selected
-and reused, unchanged, for test inference. No threshold tuning happens on
-test data.
+Checking every single Source-1 record against every Source-2 and Source-3
+record is simply not possible at this scale — it would need way too much
+memory and time. So instead, we use a smarter approach called **blocking**:
+we use a few simple, cheap rules to quickly shortlist realistic candidates,
+and we take the **union** of everything any rule finds (meaning: if even
+one rule thinks two records might match, we keep that pair in our
+shortlist). This favors not missing out on real matches.
 
-## Output Generation
+| Rule | What it checks | Turned on? |
+|---|---|---|
+| Exact country match | Country strings match exactly after cleaning | Yes |
+| Shared name words | Records share at least one meaningful word in the business name | Yes |
+| Shared address words | Records share at least one meaningful word in the address | No (off by default) |
+| Similar-looking name (n-grams) | Catches typos/near-duplicates that word-matching would miss | No (off by default) |
+| Matching postal/PIN code | A postal code extracted from the address matches | Yes (given extra weight, since it's a strong signal) |
 
-`output/candidate_pairs.tsv` records, for every test Source-1 entity, the
-exact set of Source-2/Source-3 IDs that were sent to the model (i.e. the
-post-blocking, pre-threshold candidate set). `output/matching_results.tsv`
-records, for every test Source-1 entity, the subset of those candidates
-whose predicted probability met or exceeded the chosen threshold. Before
-either file is written, the pipeline asserts every ID in
-`matching_results.tsv` also appears in that entity's `candidate_pairs.tsv`
-row.
+We build one shortlisting index from all of Source-2 + Source-3 just once
+*(`build_candidate_index()` in `src/blocking.py`)*, and reuse it every time
+we need it (for the training split, the validation split, and the final
+run) — rebuilding it again and again would just waste time since the
+underlying data doesn't change.
 
-## Reproducibility
+**Why we process the shortlisting step in batches too:** *(`generate_candidates()` in `src/blocking.py`)*
+If we tried to match all Source-1 records against the shortlisting index in
+a single pass, the in-between result table becomes enormous — potentially
+hundreds of millions of rows — and our system ran out of memory when we
+tried this at full scale. So we process Source-1 records in batches of
+50,000 at a time instead. This is purely about managing memory — every
+Source-1 record is still processed exactly the same way, and the final
+shortlist for any entity doesn't change because of this.
 
-A single fixed random seed (`config.RANDOM_SEED = 42`) drives both the
-entity-level train/validation split and the model's internal randomness
-(e.g. Random Forest bootstrapping). All dependencies are pinned in
-`requirements.txt`. Running `python -m src.main` against the same
-`dataset/` contents will always produce the same outputs. No dataset row
-counts or country lists are hard-coded anywhere in the code.
+**Why two of our rules are switched off by default:**
+Turning on the "shared address words" and "similar-looking name" rules
+would create a huge number of extra shortlist entries (tens of millions),
+but only add a small improvement in recall — while using a lot more memory.
+Since our two strongest rules (name words + postal code) already give
+decent coverage, we keep these two extra rules off by default so the
+pipeline runs smoothly and reliably. They can easily be switched back on in
+our settings file *(`src/config.py`)* if someone wants to try pushing the
+recall higher than our current 0.280.
 
-## Fair Play
+Every rule that finds a candidate adds a small score to that candidate (a
+postal code match counts for more, since it's a much stronger signal than
+just one shared word). If a Source-1 entity ends up with more than 60
+candidates after combining all rules, we only keep the top 60
+highest-scoring ones, just to keep things manageable — we never throw away
+a candidate that none of our rules would have picked anyway.
 
-This project uses **only** the data provided under `dataset/train/` and
-`dataset/test/`. No internet access, external APIs, geocoding services, or
-government/business-lookup databases were used at any stage of
-development, feature engineering, model training, or inference.
+The file `candidate_pairs.tsv` that we submit contains exactly this final
+shortlist — the same one our model actually uses to make its final
+predictions — so it honestly reflects our real recall ceiling (0.280).
+
+---
+
+## 3. Model Architecture and Feature Engineering
+
+### Features (how we turn a pair of records into numbers) — *(`src/features.py`)*
+
+All our features are numbers, and we made sure none of them break or turn
+into errors when a name or address is missing (a missing value is simply
+treated as an empty piece of text).
+
+- **Name-based features:** exact match, character similarity, spelling
+  similarity (Levenshtein), Jaro-Winkler similarity, word overlap (Jaccard),
+  number of shared words, TF-IDF cosine similarity, and the difference in
+  length.
+- **Address-based features:** the same set of comparisons as above, plus a
+  simple yes/no flag for whether the postal codes match.
+- **Other features:** whether the countries match exactly, and whether the
+  candidate came from Source-2 or Source-3 (since the two sources can have
+  slightly different data quality).
+
+For the TF-IDF comparisons, we build a fresh vocabulary separately for
+training and for testing, so nothing "leaks" between the two. Because
+TF-IDF vectors are normalized, we're able to compute similarity for a
+whole batch of pairs at once (instead of one pair at a time), which makes
+things run much faster at this scale.
+
+### Model — *(`src/model.py`)*
+
+We used **Logistic Regression** (with `class_weight="balanced"` to handle
+the fact that non-matching pairs vastly outnumber matching ones). We chose
+it because:
+- It gives clean probability scores, which we need for picking our
+  threshold.
+- It's fast enough to retrain on the entire training set.
+
+We also kept a **Random Forest** model as an alternative option in our
+settings file *(`config.MODEL_TYPE` in `src/config.py`)*, in case someone
+wants to experiment with it instead.
+
+**Keeping the training set manageable (downsampling):** *(`src/evaluation.py`
+for the train/validation run, `src/inference.py` for the final full-data
+training run)*
+If we used every single shortlisted pair for training, we'd end up with
+tens of millions of rows. So we keep *all* the true-match (positive) pairs,
+but we only keep up to 10 non-matching pairs for every 1 matching pair (a
+common and accepted technique for this kind of imbalanced problem). This
+downsampling is only used while *training* the model — when we actually
+score our validation data or the test data, we score every single pair, no
+sampling involved.
+
+**License note:** We used scikit-learn's Logistic Regression, which is
+BSD-3-Clause licensed — a permissive open-source license (similar in
+spirit to MIT/Apache 2.0), with no restrictions on commercial use. Neither
+of our candidate models is a deep learning model, and both are far below
+the 8-billion-parameter limit allowed by the challenge rules.
+
+---
+
+## 4. Other Relevant Information
+
+- **Reproducibility:** Everything is controlled by one fixed random seed
+  (`config.RANDOM_SEED = 42` in `src/config.py`) — the train/validation
+  split, the downsampling, and the model training. All our library
+  versions are pinned in `requirements.txt`. Running `python -m src.main`
+  *(`src/main.py`)* on the same data will always give the same result.
+- **Handling new countries:** *(`src/blocking.py` and `src/features.py`)*
+  We treat "country" as just a plain text label — we never hard-code a
+  fixed list of countries. This is important because the test set
+  includes France, which never appears anywhere in the training data, and
+  our pipeline handles it without any special changes.
+- **Sanity check before submitting:** *(`src/main.py`, right before the
+  output files are written)* Before writing our output files, we
+  automatically check that every match we predict was actually part of
+  that entity's own shortlist — if it isn't, the pipeline stops and flags
+  it immediately, instead of silently submitting a broken file.
+- **Fair play:** We only used the data provided under `dataset/train/` and
+  `dataset/test/`. No internet lookups, external APIs, geocoding tools, or
+  any government/business databases were used at any point.
