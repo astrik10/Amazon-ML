@@ -1,59 +1,57 @@
 """
-Ground-truth label handling.
+labels.py
 
-Converts train_ground_truth.tsv (one row per Source-1 entity with a
-comma-separated matched_entity_ids string) into:
-  1) a lookup dict {source1_entity_id: set(matched_ids)}
-  2) pair-level 0/1 labels attached to a candidate-pairs table
-
-Empty ground truth must map to an EMPTY set, never to {""}.
+Handles the ground truth file - turning "S1-001, matches S2-1,S2-2"
+into something we can use to label candidate pairs as match/no-match.
 """
 from __future__ import annotations
 
 import pandas as pd
 
-_EMPTY: set[str] = set()
 
-
-def parse_matched_ids(raw: object) -> set[str]:
-    """Parse a comma-separated matched_entity_ids string into a set of IDs."""
+def parse_matched_ids(raw) -> set:
+    """Turn a comma separated string of ids into a set of ids."""
     if raw is None or (isinstance(raw, float) and pd.isna(raw)):
         return set()
+
     text = str(raw).strip()
     if not text:
         return set()
-    ids = {part.strip() for part in text.split(",")}
-    ids.discard("")  # guard against trailing commas / stray empties
+
+    parts = text.split(",")
+    ids = set()
+    for part in parts:
+        part = part.strip()
+        if part:
+            ids.add(part)
     return ids
 
 
-def build_ground_truth_lookup(ground_truth_df: pd.DataFrame) -> dict[str, set[str]]:
-    """Build {source1_entity_id: set(matched_entity_ids)} from ground truth."""
-    lookup: dict[str, set[str]] = {}
+def build_ground_truth_lookup(ground_truth_df: pd.DataFrame) -> dict:
+    """
+    Build a dictionary like:
+        {"S1-001": {"S2-1", "S2-2"}, "S1-002": {"S3-9"}, ...}
+    so we can quickly look up the true matches for any Source-1 entity.
+    """
+    lookup = {}
     for row in ground_truth_df.itertuples(index=False):
         lookup[row.source1_entity_id] = parse_matched_ids(row.matched_entity_ids)
     return lookup
 
 
-def attach_pair_labels(pairs_df: pd.DataFrame, gt_lookup: dict[str, set[str]]) -> pd.DataFrame:
+def attach_pair_labels(pairs_df: pd.DataFrame, gt_lookup: dict) -> pd.DataFrame:
     """
-    Given a flat pairs table (source1_entity_id, candidate_entity_id), attach
-    a binary 'label' column: 1 if the candidate is a true match for that
-    Source-1 entity, else 0. Source-1 entities absent from ground truth are
-    treated as having no matches (label 0 for all their candidates).
+    Given a table of (source1_entity_id, candidate_entity_id) pairs, add
+    a 'label' column: 1 if that candidate is a true match, 0 otherwise.
+    """
+    labels_list = []
+    for row in pairs_df.itertuples(index=False):
+        true_matches = gt_lookup.get(row.source1_entity_id, set())
+        if row.candidate_entity_id in true_matches:
+            labels_list.append(1)
+        else:
+            labels_list.append(0)
 
-    PERF NOTE: this used to be `out.apply(_label, axis=1)`, which calls a
-    Python function once per row through pandas' row-apply machinery --
-    on a few hundred thousand candidate pairs that adds up to most of the
-    pipeline's runtime for something that's really just two dict lookups.
-    A plain zip + list comprehension does the same thing without the
-    per-row Series construction overhead.
-    """
-    out = pairs_df.copy()
-    s1_ids = out["source1_entity_id"]
-    cand_ids = out["candidate_entity_id"]
-    out["label"] = [
-        1 if cand_id in gt_lookup.get(s1_id, _EMPTY) else 0
-        for s1_id, cand_id in zip(s1_ids, cand_ids)
-    ]
-    return out
+    result_df = pairs_df.copy()
+    result_df["label"] = labels_list
+    return result_df

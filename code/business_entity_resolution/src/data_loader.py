@@ -1,11 +1,8 @@
 """
-Data loading utilities.
+data_loader.py
 
-Everything here is deliberately defensive: files are read as TSV with
-sep="\\t", required columns are validated, and the logical "source"
-(source1 / source2 / source3) of a file is inferred from the entity_id
-prefix rather than assumed from the file name. Nothing is hard-coded
-about row counts or which countries can appear.
+Just reads the tsv files and makes sure they look right before we use
+them. Nothing fancy here.
 """
 from __future__ import annotations
 
@@ -21,52 +18,49 @@ logger = logging.getLogger(__name__)
 
 
 class DataValidationError(Exception):
-    """Raised when an input file does not match the expected schema."""
+    """We raise this if a file doesn't have the columns we expect."""
 
 
-def _validate_columns(df: pd.DataFrame, required_columns: list[str], path: Path) -> None:
-    missing = [c for c in required_columns if c not in df.columns]
-    if missing:
+def _validate_columns(df, required_columns, path):
+    missing_columns = []
+    for col in required_columns:
+        if col not in df.columns:
+            missing_columns.append(col)
+
+    if missing_columns:
         raise DataValidationError(
-            f"File '{path}' is missing required column(s): {missing}. "
-            f"Found columns: {list(df.columns)}"
+            f"File '{path}' is missing column(s): {missing_columns}. "
+            f"Columns found: {list(df.columns)}"
         )
 
 
 def infer_source_from_ids(entity_ids: pd.Series) -> str:
     """
-    Infer the logical source ('source1' / 'source2' / 'source3') for a
-    column of entity_ids by looking at the (majority) ID prefix.
-
-    We use majority-vote rather than the first row so a single malformed
-    ID does not break source detection.
+    Look at the entity_id prefixes (like S1-, S2-, S3-) and figure out
+    which source this file belongs to. We use the most common prefix,
+    just in case one row has a typo.
     """
     prefixes = entity_ids.astype(str).str.slice(0, 3)
-    counts = prefixes.value_counts()
-    if counts.empty:
-        raise DataValidationError("Cannot infer source: entity_id column is empty.")
-    top_prefix = counts.idxmax()
-    if top_prefix not in config.SOURCE_PREFIX_MAP:
+    prefix_counts = prefixes.value_counts()
+
+    if prefix_counts.empty:
+        raise DataValidationError("Cannot figure out the source - entity_id column is empty.")
+
+    most_common_prefix = prefix_counts.idxmax()
+
+    if most_common_prefix not in config.SOURCE_PREFIX_MAP:
         raise DataValidationError(
-            f"Unrecognized entity_id prefix '{top_prefix}'. "
+            f"Unknown entity_id prefix '{most_common_prefix}'. "
             f"Expected one of {list(config.SOURCE_PREFIX_MAP.keys())}."
         )
-    return config.SOURCE_PREFIX_MAP[top_prefix]
+
+    return config.SOURCE_PREFIX_MAP[most_common_prefix]
 
 
 def load_source_file(path: Path, expected_source: Optional[str] = None) -> pd.DataFrame:
-    """
-    Load a single Source TSV file, validate its schema, and tag every row
-    with a 'source' column ('source1' / 'source2' / 'source3').
-
-    Parameters
-    ----------
-    path: path to the .tsv file
-    expected_source: if given, raise if the inferred source does not match
-        (helps catch e.g. accidentally swapped file paths).
-    """
+    """Load one source tsv file and tag it with which source it is."""
     if not path.exists():
-        raise FileNotFoundError(f"Expected input file not found: {path}")
+        raise FileNotFoundError(f"File not found: {path}")
 
     logger.info("Loading source file: %s", path)
     df = pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False, na_values=[""])
@@ -75,28 +69,23 @@ def load_source_file(path: Path, expected_source: Optional[str] = None) -> pd.Da
     inferred_source = infer_source_from_ids(df["entity_id"])
     if expected_source is not None and inferred_source != expected_source:
         raise DataValidationError(
-            f"File '{path}' was expected to contain '{expected_source}' records "
-            f"but entity_id prefixes indicate '{inferred_source}'."
+            f"File '{path}' was supposed to be '{expected_source}' but looks "
+            f"like '{inferred_source}' based on the entity_id prefixes."
         )
+
     df = df.copy()
     df["source"] = inferred_source
 
-    n_dupes = df["entity_id"].duplicated().sum()
-    if n_dupes:
-        logger.warning("File '%s' contains %d duplicate entity_id values.", path, n_dupes)
+    duplicate_count = df["entity_id"].duplicated().sum()
+    if duplicate_count:
+        logger.warning("File '%s' has %d duplicate entity_id values.", path, duplicate_count)
 
     logger.info("Loaded %d rows from %s (source=%s)", len(df), path.name, inferred_source)
     return df
 
 
 def load_ground_truth(path: Path) -> pd.DataFrame:
-    """
-    Load train_ground_truth.tsv and validate its schema.
-
-    matched_entity_ids is kept as a raw string column; parsing into a list
-    of IDs is handled separately (see labels.parse_matched_ids) because an
-    empty string must map to "no matches", not to [""] .
-    """
+    """Load train_ground_truth.tsv."""
     if not path.exists():
         raise FileNotFoundError(f"Ground truth file not found: {path}")
 
@@ -104,19 +93,18 @@ def load_ground_truth(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False, na_values=[])
     _validate_columns(df, config.GROUND_TRUTH_REQUIRED_COLUMNS, path)
 
-    n_dupes = df["source1_entity_id"].duplicated().sum()
-    if n_dupes:
+    duplicate_count = df["source1_entity_id"].duplicated().sum()
+    if duplicate_count:
         logger.warning(
-            "Ground truth file '%s' contains %d duplicate source1_entity_id rows.",
-            path, n_dupes,
+            "Ground truth file '%s' has %d duplicate source1_entity_id rows.", path, duplicate_count
         )
 
     logger.info("Loaded ground truth for %d Source-1 entities", len(df))
     return df
 
 
-def load_train_data() -> dict[str, pd.DataFrame]:
-    """Load all four training files."""
+def load_train_data() -> dict:
+    """Load source1, source2, source3 and ground truth for training."""
     return {
         "source1": load_source_file(config.TRAIN_SOURCE1_PATH, expected_source="source1"),
         "source2": load_source_file(config.TRAIN_SOURCE2_PATH, expected_source="source2"),
@@ -125,8 +113,8 @@ def load_train_data() -> dict[str, pd.DataFrame]:
     }
 
 
-def load_test_data() -> dict[str, pd.DataFrame]:
-    """Load all three test files (no ground truth at test time)."""
+def load_test_data() -> dict:
+    """Load source1, source2, source3 for testing (no ground truth here)."""
     return {
         "source1": load_source_file(config.TEST_SOURCE1_PATH, expected_source="source1"),
         "source2": load_source_file(config.TEST_SOURCE2_PATH, expected_source="source2"),

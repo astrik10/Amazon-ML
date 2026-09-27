@@ -1,10 +1,9 @@
 """
-Text normalization for business names, addresses and countries.
+preprocessing.py
 
-Normalization is intentionally conservative: it lowercases, strips accents,
-normalizes punctuation/whitespace, expands common address abbreviations and
-business-suffix variants, and unifies "&"/"and" — but it never drops tokens
-that could carry matching signal (e.g. numbers, unit identifiers).
+Cleans up the raw text fields (name, address, country) so that things
+like "Corp" and "Corporation" or "Rd" and "Road" compare as equal
+instead of looking like completely different strings.
 """
 from __future__ import annotations
 
@@ -13,12 +12,7 @@ import unicodedata
 
 import pandas as pd
 
-# ---------------------------------------------------------------------------
-# Lookup tables
-# ---------------------------------------------------------------------------
-
-# Common street/address abbreviations -> expanded form.
-# Matched as whole tokens only (word boundaries), case-insensitive.
+# Common address word shortcuts -> full word.
 ADDRESS_ABBREVIATIONS = {
     "rd": "road",
     "st": "street",
@@ -49,13 +43,12 @@ ADDRESS_ABBREVIATIONS = {
     "nw": "northwest",
     "se": "southeast",
     "sw": "southwest",
-    "po": "po",  # "po box" kept as-is, handled separately
+    "po": "po",
 }
 
-# Common business-entity suffix normalization. Longer / multi-word patterns
-# are applied first via regex so "private limited" collapses before the
-# single-word table would otherwise leave "private" and "limited" separate.
-BUSINESS_SUFFIX_PHRASES = [
+# Business suffix patterns. Longer phrases go first so "private limited"
+# gets caught before we'd otherwise leave "private" and "limited" separate.
+BUSINESS_SUFFIX_PATTERNS = [
     (r"\bprivate limited\b", "pvt ltd"),
     (r"\blimited liability company\b", "llc"),
     (r"\blimited liability partnership\b", "llp"),
@@ -67,105 +60,115 @@ BUSINESS_SUFFIX_PHRASES = [
 
 
 def _strip_accents(text: str) -> str:
-    """Unicode-normalize and strip diacritics (e.g. 'Café' -> 'cafe')."""
+    """Turn accented letters into plain ones, e.g. 'Cafe' from 'Café'."""
     normalized = unicodedata.normalize("NFKD", text)
-    return "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    result = ""
+    for ch in normalized:
+        if not unicodedata.combining(ch):
+            result += ch
+    return result
 
 
 def _basic_clean(text: str) -> str:
-    """Lowercase, strip accents, normalize punctuation and whitespace."""
+    """Lowercase, remove accents, clean up punctuation and spacing."""
     text = _strip_accents(text)
     text = text.lower()
-    # Unify "&" with "and"
     text = text.replace("&", " and ")
-    # Replace punctuation (except alnum, whitespace) with a space
     text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
-    # Collapse multiple whitespace into one
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
 
 def _apply_business_suffixes(text: str) -> str:
-    for pattern, replacement in BUSINESS_SUFFIX_PHRASES:
+    for pattern, replacement in BUSINESS_SUFFIX_PATTERNS:
         text = re.sub(pattern, replacement, text)
     return text
 
 
 def _apply_address_abbreviations(text: str) -> str:
-    tokens = text.split(" ")
-    expanded = [ADDRESS_ABBREVIATIONS.get(tok, tok) for tok in tokens]
-    return " ".join(expanded)
+    words = text.split(" ")
+    new_words = []
+    for word in words:
+        if word in ADDRESS_ABBREVIATIONS:
+            new_words.append(ADDRESS_ABBREVIATIONS[word])
+        else:
+            new_words.append(word)
+    return " ".join(new_words)
 
 
-def normalize_business_name(raw_name: object) -> str:
-    """Normalize a business name string. Returns '' for missing values."""
+def normalize_business_name(raw_name) -> str:
+    """Clean up a business name. Returns '' if there's nothing there."""
     if raw_name is None or (isinstance(raw_name, float) and pd.isna(raw_name)):
         return ""
+
     text = str(raw_name).strip()
     if not text:
         return ""
+
     text = _basic_clean(text)
     text = _apply_business_suffixes(text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
 
-def normalize_address(raw_address: object) -> str:
-    """Normalize an address string. Returns '' for missing values."""
+def normalize_address(raw_address) -> str:
+    """Clean up an address. Returns '' if there's nothing there."""
     if raw_address is None or (isinstance(raw_address, float) and pd.isna(raw_address)):
         return ""
+
     text = str(raw_address).strip()
     if not text:
         return ""
+
     text = _basic_clean(text)
     text = _apply_address_abbreviations(text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
 
-def normalize_country(raw_country: object) -> str:
+def normalize_country(raw_country) -> str:
     """
-    Normalize a country string. Treated as an OPEN-SET string — no hard-coded
-    list of valid countries, no mapping to ISO codes (that would require an
-    external reference table). Just consistent casing/formatting.
+    Clean up a country name. We don't try to match it against a fixed
+    list of countries - just clean formatting so the same country name
+    written differently still matches.
     """
     if raw_country is None or (isinstance(raw_country, float) and pd.isna(raw_country)):
         return ""
+
     text = str(raw_country).strip()
     if not text:
         return ""
+
     text = _strip_accents(text).lower()
     text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
 
-def extract_postal_code(raw_address: object) -> str:
+def extract_postal_code(raw_address) -> str:
     """
-    Best-effort extraction of a postal/PIN-like code from a raw address
-    string: a standalone run of 4-8 digits (optionally with one internal
-    hyphen, e.g. US ZIP+4). Returns '' if none found. This is a heuristic
-    signal only, used for an extra blocking/feature rule — not a source of
-    truth.
+    Try to pull a postal/PIN code out of the address (a run of 4-8
+    digits). This is just a rough guess, not guaranteed to be right,
+    but it's a useful extra signal for blocking/matching.
     """
     if raw_address is None or (isinstance(raw_address, float) and pd.isna(raw_address)):
         return ""
+
     text = str(raw_address)
     matches = re.findall(r"\b\d{4,8}(?:-\d{3,4})?\b", text)
     if not matches:
         return ""
-    # Prefer the last match — postal codes usually trail the address.
-    return matches[-1].replace("-", "")
+
+    # postal codes are usually near the end of the address, so take the last match
+    last_match = matches[-1]
+    return last_match.replace("-", "")
 
 
 def add_normalized_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Return a copy of df with normalized_* columns added, keeping the
-    original business_name / business_address / country columns intact.
-    """
-    out = df.copy()
-    out["normalized_business_name"] = out["business_name"].map(normalize_business_name)
-    out["normalized_business_address"] = out["business_address"].map(normalize_address)
-    out["normalized_country"] = out["country"].map(normalize_country)
-    out["postal_code"] = out["business_address"].map(extract_postal_code)
-    return out
+    """Add normalized_* columns to a dataframe, keeping the original columns too."""
+    df = df.copy()
+    df["normalized_business_name"] = df["business_name"].map(normalize_business_name)
+    df["normalized_business_address"] = df["business_address"].map(normalize_address)
+    df["normalized_country"] = df["country"].map(normalize_country)
+    df["postal_code"] = df["business_address"].map(extract_postal_code)
+    return df

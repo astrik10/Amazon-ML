@@ -1,9 +1,9 @@
 """
-Classical ML model wrapper.
+model.py
 
-Uses scikit-learn's LogisticRegression (default) or RandomForestClassifier,
-both BSD-licensed and well under the 8B-parameter ceiling. Class imbalance
-(most candidate pairs are non-matches) is handled with class_weight="balanced".
+Small wrapper around a scikit-learn classifier. We use Logistic
+Regression by default (fast, gives nice probabilities), but Random
+Forest is available too if you change MODEL_TYPE in config.py.
 """
 from __future__ import annotations
 
@@ -23,9 +23,10 @@ logger = logging.getLogger(__name__)
 
 
 class EntityMatchModel:
-    """Thin wrapper around a scikit-learn classifier for pair matching."""
+    """Wraps a scikit-learn classifier so the rest of the code doesn't
+    need to care which one we're using."""
 
-    def __init__(self, model_type: str = config.MODEL_TYPE, random_state: int = config.RANDOM_SEED):
+    def __init__(self, model_type=config.MODEL_TYPE, random_state=config.RANDOM_SEED):
         self.model_type = model_type
         self.random_state = random_state
         self.model = self._build_model()
@@ -40,20 +41,24 @@ class EntityMatchModel:
                 random_state=self.random_state,
                 n_jobs=-1,
             )
-        # Default: logistic regression baseline.
+        # default: logistic regression
         return LogisticRegression(
             max_iter=2000,
             class_weight="balanced",
             random_state=self.random_state,
         )
 
-    def fit(self, features_df: pd.DataFrame, labels: pd.Series) -> "EntityMatchModel":
+    def fit(self, features_df: pd.DataFrame, labels: pd.Series):
         X = features_df[self.feature_columns].to_numpy(dtype=float)
         y = labels.to_numpy(dtype=int)
+
+        num_positive = int(y.sum())
+        num_negative = int(len(y) - num_positive)
         logger.info(
             "Training %s on %d pairs (%d positive, %d negative)",
-            self.model_type, len(y), int(y.sum()), int((1 - y).sum()),
+            self.model_type, len(y), num_positive, num_negative,
         )
+
         self.model.fit(X, y)
         return self
 
@@ -61,16 +66,21 @@ class EntityMatchModel:
         if features_df.empty:
             return np.array([])
         X = features_df[self.feature_columns].to_numpy(dtype=float)
-        return self.model.predict_proba(X)[:, 1]
+        probabilities = self.model.predict_proba(X)
+        return probabilities[:, 1]  # probability of "match" class
 
-    def save(self, path: Path = config.MODEL_PATH) -> None:
+    def save(self, path: Path = config.MODEL_PATH):
         path.parent.mkdir(parents=True, exist_ok=True)
-        joblib.dump({"model": self.model, "model_type": self.model_type,
-                     "feature_columns": self.feature_columns}, path)
+        payload = {
+            "model": self.model,
+            "model_type": self.model_type,
+            "feature_columns": self.feature_columns,
+        }
+        joblib.dump(payload, path)
         logger.info("Saved trained model to %s", path)
 
     @classmethod
-    def load(cls, path: Path = config.MODEL_PATH) -> "EntityMatchModel":
+    def load(cls, path: Path = config.MODEL_PATH):
         payload = joblib.load(path)
         instance = cls(model_type=payload["model_type"])
         instance.model = payload["model"]

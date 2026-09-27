@@ -1,15 +1,14 @@
 """
-Main entry point.
+main.py
 
-Usage:
-    python -m src.main
+Run this with:  python -m src.main
 
-Runs, in order:
-  1. Load + normalize training data
-  2. Entity-level validation (candidate recall, threshold sweep, report)
-  3. Train the final model on ALL training data
-  4. Load + normalize test data, generate candidates, score, apply threshold
-  5. Write output/matching_results.tsv and output/candidate_pairs.tsv
+What it does, step by step:
+  1. Load and clean up the training data
+  2. Split into train/validation, train a model, pick the best threshold
+  3. Train the final model on all the training data
+  4. Load and clean up the test data
+  5. Run the model on the test data and save the two output files
 """
 from __future__ import annotations
 
@@ -28,16 +27,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --------------------------------------------------------------------------
-# TEMP: sanity-check switch. Set to None (or 0) to run the full dataset.
-# Set to a small number (e.g. 20000) to first confirm the pipeline runs
-# clean and to get a rough per-entity timing before committing to the full
-# ~2.2M-row run. REMOVE / set back to None once you've validated things.
-# --------------------------------------------------------------------------
-SAMPLE_SOURCE1_ROWS: int | None = 20000
+# Set this to a small number (like 20000) to quickly test the pipeline
+# on a subset before running the real thing. Must be None for the real
+# run - every test entity needs to show up in the final output.
+SAMPLE_SOURCE1_ROWS = None
 
 
-def set_global_seed(seed: int = config.RANDOM_SEED) -> None:
+def set_global_seed(seed=config.RANDOM_SEED):
     random.seed(seed)
     np.random.seed(seed)
 
@@ -46,7 +42,7 @@ def _normalize(df):
     return preprocessing.add_normalized_columns(df)
 
 
-def main() -> int:
+def main():
     set_global_seed()
     config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     config.MODEL_DIR.mkdir(parents=True, exist_ok=True)
@@ -54,8 +50,8 @@ def main() -> int:
     logger.info("STEP 1/5: Loading training data")
     try:
         train_data = data_loader.load_train_data()
-    except (FileNotFoundError, data_loader.DataValidationError) as exc:
-        logger.error("Failed to load training data: %s", exc)
+    except (FileNotFoundError, data_loader.DataValidationError) as error:
+        logger.error("Failed to load training data: %s", error)
         return 1
 
     train_source1 = _normalize(train_data["source1"])
@@ -64,8 +60,9 @@ def main() -> int:
     ground_truth = train_data["ground_truth"]
 
     if SAMPLE_SOURCE1_ROWS:
-        logger.info(
-            "TEMP SAMPLE MODE: limiting Source-1 to first %d rows (out of %d) for a quick sanity check",
+        logger.warning(
+            "SAMPLE MODE ACTIVE: only using first %d Source-1 rows (out of %d). "
+            "Do NOT use this for a real submission run.",
             SAMPLE_SOURCE1_ROWS, len(train_source1),
         )
         train_source1 = train_source1.head(SAMPLE_SOURCE1_ROWS).reset_index(drop=True)
@@ -86,8 +83,8 @@ def main() -> int:
     logger.info("STEP 4/5: Loading and normalizing test data")
     try:
         test_data = data_loader.load_test_data()
-    except (FileNotFoundError, data_loader.DataValidationError) as exc:
-        logger.error("Failed to load test data: %s", exc)
+    except (FileNotFoundError, data_loader.DataValidationError) as error:
+        logger.error("Failed to load test data: %s", error)
         return 1
 
     test_source1 = _normalize(test_data["source1"])
@@ -108,10 +105,10 @@ def main() -> int:
     logger.info("Wrote %s (%d rows)", config.MATCHING_RESULTS_PATH, len(matching_results_df))
     logger.info("Wrote %s (%d rows)", config.CANDIDATE_PAIRS_PATH, len(candidate_pairs_df))
 
-    n_with_matches = (matching_results_df["matched_entity_ids"] != "").sum()
+    entities_with_matches = (matching_results_df["matched_entity_ids"] != "").sum()
     logger.info(
         "%d / %d test Source-1 entities received at least one match",
-        n_with_matches, len(matching_results_df),
+        entities_with_matches, len(matching_results_df),
     )
 
     logger.info("Pipeline complete.")

@@ -1,15 +1,15 @@
 """
-Central configuration for the Business Entity Resolution pipeline.
+config.py
 
-All paths, thresholds and hyperparameters live here so the rest of the
-codebase never hard-codes a path or a magic number.
+This file just holds all the settings for the project in one place.
+Paths, thresholds, blocking limits, etc. That way we don't have random
+numbers scattered all over the code.
 """
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-# This file lives in <project_root>/src/config.py
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 DATASET_DIR = PROJECT_ROOT / "dataset"
@@ -33,62 +33,64 @@ MODEL_DIR = PROJECT_ROOT / "models"
 MODEL_PATH = MODEL_DIR / "entity_resolution_model.joblib"
 
 # ---------------------------------------------------------------------------
-# Reproducibility
+# Random seed - keeping this fixed makes results repeatable
 # ---------------------------------------------------------------------------
 RANDOM_SEED = 42
 
 # ---------------------------------------------------------------------------
-# Validation
+# Train / validation split
 # ---------------------------------------------------------------------------
-# Fraction of Source-1 TRAIN entities held out for validation (entity-level
-# split, never a record/pair-level split, to avoid leakage).
+# We hold out 20% of the training entities to check how well the model
+# is doing before we run it on the real test data.
 VALIDATION_ENTITY_FRACTION = 0.2
 
-# Candidate probability thresholds to sweep during validation. The final
-# threshold used at test time is chosen ONLY from validation performance.
+# We try each of these probability cutoffs and see which one gives the
+# best F0.5 score on the validation set.
 THRESHOLD_CANDIDATES = [0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90]
 
 # ---------------------------------------------------------------------------
-# Blocking
+# Blocking settings (this is the "candidate generation" step)
 # ---------------------------------------------------------------------------
-# NOTE ON SCALE: at ~12.5M total records, exploding address tokens over the
-# full ~10.3M-record candidate pool produced ~23M rows and was a major
-# memory cost (see blocking.py). MIN_TOKEN_LENGTH and MAX_POSTING_LIST_SIZE
-# below were tightened from their original values to cut memory usage --
-# they trade a small amount of blocking recall for a much smaller footprint.
-MIN_TOKEN_LENGTH = 4            # ignore very short/noisy tokens when blocking (was 3)
-NGRAM_SIZE = 4                  # character n-gram size used for n-gram blocking
-MAX_CANDIDATES_PER_ENTITY = 60  # soft cap; highest-scoring candidates kept
+MIN_TOKEN_LENGTH = 4          # skip very short/noisy words when blocking
+NGRAM_SIZE = 4                 # size of character chunks for n-gram blocking
+MAX_CANDIDATES_PER_ENTITY = 60  # don't keep more than this many candidates per entity
 
-# A token/n-gram/postal value shared by more than this many candidate
-# records is dropped from that blocking rule before the merge -- too
-# common to prune anything, and expensive to carry through at this scale.
-MAX_POSTING_LIST_SIZE = 1000    # was effectively 5000 (default) before
+# If a word/token is shared by more candidate records than this, we just
+# skip it as a blocking key - too common to be useful, and expensive to
+# process at this scale.
+MAX_POSTING_LIST_SIZE = 1000
 
-# Character n-gram blocking is the most memory/time-expensive rule at this
-# scale (10M+ rows x ~17 four-grams each before capping). Off by default.
+# These two blocking rules add extra recall but are expensive to run on
+# a huge dataset, so we keep them off by default. Can turn on if needed.
 ENABLE_NGRAM_BLOCKING = False
-
-# Address-token blocking is the second most expensive rule (~23M exploded
-# rows on this dataset) for comparatively little extra recall once name
-# tokens + postal code are already blocking. Off by default at this scale;
-# turn back on if candidate recall in the validation report looks too low.
 ENABLE_ADDR_TOKEN_BLOCKING = False
 
 # ---------------------------------------------------------------------------
-# Model
+# Processing in chunks (needed because the dataset is millions of rows)
 # ---------------------------------------------------------------------------
-# "logistic_regression" or "random_forest"
-MODEL_TYPE = "logistic_regression"
+# We process Source-1 entities in batches of this size instead of all at
+# once - doing everything in one go runs out of memory on a dataset this
+# big.
+SOURCE1_CHUNK_SIZE = 50000
+
+# When building the training data, we keep ALL positive (true match)
+# pairs, but only keep a limited number of negative (non-match) pairs
+# per positive - there are way more negatives than we actually need.
+NEGATIVE_SAMPLE_RATIO = 10
+MIN_NEGATIVES_PER_CHUNK = 200
 
 # ---------------------------------------------------------------------------
-# Schema
+# Model choice
+# ---------------------------------------------------------------------------
+MODEL_TYPE = "logistic_regression"  # or "random_forest"
+
+# ---------------------------------------------------------------------------
+# Expected columns in the input files
 # ---------------------------------------------------------------------------
 SOURCE_REQUIRED_COLUMNS = ["entity_id", "business_name", "business_address", "country"]
 GROUND_TRUTH_REQUIRED_COLUMNS = ["source1_entity_id", "matched_entity_ids"]
 
-# Maps an entity_id prefix to a logical source name. Used to auto-detect the
-# source of a file instead of hard-coding which file is which.
+# entity_id prefix tells us which source a row belongs to
 SOURCE_PREFIX_MAP = {
     "S1-": "source1",
     "S2-": "source2",
